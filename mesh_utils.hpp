@@ -3,6 +3,7 @@
 
 #include <glm/glm.hpp>
 
+#include <numeric>
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
@@ -21,29 +22,33 @@
 
 namespace mesh_utils {
 
+using FaceIdx = uint32_t;
+using VertexIdx = uint32_t;
+using EdgeIdx = uint32_t;
+
 struct Vertex {
     glm::vec3 position;
-    std::vector<uint32_t> incident_faces;
-    std::vector<uint32_t> incident_edges;
+    std::vector<FaceIdx> incident_face_indices;
+    std::vector<EdgeIdx> incident_edge_indices;
 };
 
-struct Edge {
-    uint32_t v0;
-    uint32_t v1;
-    std::vector<uint32_t> incident_faces;
+struct EdgeByIndices {
+    VertexIdx v0_idx;
+    VertexIdx v1_idx;
+    std::vector<FaceIdx> incident_face_indices;
 
-    bool is_boundary() const { return incident_faces.size() == 1; }
-    bool is_internal() const { return incident_faces.size() == 2; }
-    bool is_non_manifold() const { return incident_faces.size() > 2; }
+    bool is_boundary() const { return incident_face_indices.size() == 1; }
+    bool is_internal() const { return incident_face_indices.size() == 2; }
+    bool is_non_manifold() const { return incident_face_indices.size() > 2; }
 };
 
-struct Face {
-    std::vector<uint32_t> vertices;
-    std::vector<uint32_t> edges;
+struct FaceByIndices {
+    std::vector<VertexIdx> vertex_indices;
+    std::vector<EdgeIdx> edge_indices;
 };
 
 struct EdgeKey {
-    uint32_t a, b;
+    VertexIdx a, b;
     EdgeKey(uint32_t v0, uint32_t v1) : a(std::min(v0, v1)), b(std::max(v0, v1)) {}
     bool operator==(const EdgeKey &other) const { return a == other.a && b == other.b; }
 };
@@ -57,32 +62,43 @@ class Mesh {
     LogSection::LogMode log_mode;
 
     /// registers a vertex into this mesh, can be used later to create faces or edges with
-    uint32_t add_vertex(const glm::vec3 &position) {
+    VertexIdx add_vertex(const glm::vec3 &position) {
         GlobalLogSection _("add_vertex", log_mode);
         vertices.push_back(Vertex{position});
-        return static_cast<uint32_t>(vertices.size() - 1);
+        return static_cast<VertexIdx>(vertices.size() - 1);
     }
 
-    /// create a triangular face out of existing vertices in this mesh
-    uint32_t add_face(const std::vector<uint32_t> &face_vertices) {
+    std::vector<FaceIdx> get_all_face_indices() {
+        std::vector<FaceIdx> v(faces.size());
+        std::iota(v.begin(), v.end(), 0);
+        return v;
+    };
+
+    /**
+     * @brief create a triangular face out of existing vertices in this mesh, return the idx of the new face
+     *
+     * TODO: can we pass in an std::array 3 instead of enforcing size on the inside?
+     */
+    FaceIdx add_face(const std::vector<VertexIdx> &vertex_indices_to_construct_face) {
         GlobalLogSection _("add_face", log_mode);
 
         // Ensure the face is a triangle
-        if (face_vertices.size() != 3) {
-            global_logger->debug("add_face: rejected non-triangle face (size = {})", face_vertices.size());
+        if (vertex_indices_to_construct_face.size() != 3) {
+            global_logger->debug("add_face: rejected non-triangle face (size = {})",
+                                 vertex_indices_to_construct_face.size());
             throw std::runtime_error("Only triangular faces are supported");
         }
 
         uint32_t face_index = static_cast<uint32_t>(faces.size());
         global_logger->debug("add_face: creating triangle face with index {}", face_index);
 
-        Face face;
-        face.vertices = face_vertices;
+        FaceByIndices face;
+        face.vertex_indices = vertex_indices_to_construct_face;
 
-        // Process the 3 edges of the triangle
+        // process the 3 edges of the triangle
         for (size_t i = 0; i < 3; ++i) {
-            uint32_t v0 = face_vertices[i];
-            uint32_t v1 = face_vertices[i + 1 == 3 ? 0 : i + 1]; // Wrap around
+            uint32_t v0 = vertex_indices_to_construct_face[i];
+            uint32_t v1 = vertex_indices_to_construct_face[i + 1 == 3 ? 0 : i + 1]; // Wrap around
 
             global_logger->debug("Processing edge ({}, {})", v0, v1);
 
@@ -92,26 +108,26 @@ class Mesh {
             auto it = edge_lookup.find(key);
             if (it == edge_lookup.end()) {
                 edge_index = static_cast<uint32_t>(edges.size());
-                edges.push_back(Edge{key.a, key.b});
+                edges.push_back(EdgeByIndices{key.a, key.b});
                 edge_lookup.emplace(key, edge_index);
                 global_logger->debug("Created new edge {} with index {}", edge_index, edge_index);
 
-                vertices[key.a].incident_edges.push_back(edge_index);
-                vertices[key.b].incident_edges.push_back(edge_index);
+                vertices[key.a].incident_edge_indices.push_back(edge_index);
+                vertices[key.b].incident_edge_indices.push_back(edge_index);
                 global_logger->debug("Added edge {} to vertices {} and {}", edge_index, key.a, key.b);
             } else {
                 edge_index = it->second;
                 global_logger->debug("Found existing edge {} for vertices ({}, {})", edge_index, v0, v1);
             }
 
-            edges[edge_index].incident_faces.push_back(face_index);
-            face.edges.push_back(edge_index);
+            edges[edge_index].incident_face_indices.push_back(face_index);
+            face.edge_indices.push_back(edge_index);
             global_logger->debug("Linked edge {} with face {}", edge_index, face_index);
         }
 
-        // Link vertices to face
-        for (uint32_t v : face_vertices) {
-            vertices[v].incident_faces.push_back(face_index);
+        // link vertices to face
+        for (uint32_t v : vertex_indices_to_construct_face) {
+            vertices[v].incident_face_indices.push_back(face_index);
             global_logger->debug("Linked vertex {} with face {}", v, face_index);
         }
 
@@ -121,47 +137,47 @@ class Mesh {
         return face_index;
     }
 
-    void flip_face_winding(uint32_t face_index) {
+    void flip_face_winding(FaceIdx face_index) {
         if (face_index >= faces.size())
             throw std::out_of_range("Invalid face index");
 
-        Face &f = faces[face_index];
+        FaceByIndices &f = faces[face_index];
 
         // only works for triangles, reverse order of vertices
-        if (f.vertices.size() == 3) {
-            std::swap(f.vertices[1], f.vertices[2]);
+        if (f.vertex_indices.size() == 3) {
+            std::swap(f.vertex_indices[1], f.vertex_indices[2]);
         } else {
             // for n-gons, just reverse all vertices
-            std::reverse(f.vertices.begin(), f.vertices.end());
+            std::reverse(f.vertex_indices.begin(), f.vertex_indices.end());
         }
 
         // recompute edges for this face
-        f.edges.clear();
-        for (size_t i = 0; i < f.vertices.size(); ++i) {
-            uint32_t v0 = f.vertices[i];
-            uint32_t v1 = f.vertices[(i + 1) % f.vertices.size()];
+        f.edge_indices.clear();
+        for (size_t i = 0; i < f.vertex_indices.size(); ++i) {
+            uint32_t v0 = f.vertex_indices[i];
+            uint32_t v1 = f.vertex_indices[(i + 1) % f.vertex_indices.size()];
 
             EdgeKey key(v0, v1);
             auto it = edge_lookup.find(key);
             if (it != edge_lookup.end()) {
-                f.edges.push_back(it->second);
+                f.edge_indices.push_back(it->second);
             } else {
                 uint32_t edge_index = static_cast<uint32_t>(edges.size());
-                edges.push_back(Edge{key.a, key.b});
+                edges.push_back(EdgeByIndices{key.a, key.b});
                 edge_lookup.emplace(key, edge_index);
-                vertices[key.a].incident_edges.push_back(edge_index);
-                vertices[key.b].incident_edges.push_back(edge_index);
-                f.edges.push_back(edge_index);
+                vertices[key.a].incident_edge_indices.push_back(edge_index);
+                vertices[key.b].incident_edge_indices.push_back(edge_index);
+                f.edge_indices.push_back(edge_index);
             }
         }
     }
 
-    // I don't think returning references is good because the vector can be re-allocated right?
-    const Vertex &vertex(uint32_t i) const { return vertices[i]; }
-    const Edge &edge(uint32_t i) const { return edges[i]; }
-    const Face &face(uint32_t i) const { return faces[i]; }
+    // i don't think returning references is good because the vector can be re-allocated right?
+    const Vertex &vertex(VertexIdx i) const { return vertices[i]; }
+    const EdgeByIndices &edge(EdgeIdx i) const { return edges[i]; }
+    const FaceByIndices &face(FaceIdx i) const { return faces[i]; }
 
-    const std::vector<uint32_t> &faces_using_vertex(uint32_t v) const { return vertices[v].incident_faces; }
+    const std::vector<uint32_t> &faces_using_vertex(uint32_t v) const { return vertices[v].incident_face_indices; }
 
     struct FaceNormal {
         glm::vec3 start;
@@ -172,7 +188,7 @@ class Mesh {
         std::vector<FaceNormal> result;
         result.reserve(faces.size());
 
-        for (const Face &f : faces) {
+        for (const FaceByIndices &f : faces) {
             glm::vec3 normal = compute_face_normal(f);
             if (glm::length(normal) == 0.0f)
                 continue; // skip degenerate faces
@@ -192,24 +208,25 @@ class Mesh {
         return false;
     }
 
-    void move_face(uint32_t face_index, const glm::vec3 &delta) {
-        Face &f = faces.at(face_index);
+    void move_face(uint32_t face_idx, const glm::vec3 &delta) {
+        FaceByIndices &f = faces.at(face_idx);
 
-        for (uint32_t vi : f.vertices) {
+        for (uint32_t vi : f.vertex_indices) {
             vertices[vi].position += delta;
         }
     }
 
-    void move_face_along_normal(uint32_t face_index, float distance) {
+    void move_face_along_normal(FaceIdx face_index, float distance) {
         glm::vec3 n = compute_face_normal(faces.at(face_index));
         move_face(face_index, n * distance);
     }
-    bool face_has_internal_edge(uint32_t face_index) const {
+
+    bool face_has_internal_edge(FaceIdx face_index) const {
         if (face_index >= faces.size())
             throw std::out_of_range("Invalid face index");
 
-        const Face &f = faces[face_index];
-        for (uint32_t e_idx : f.edges) {
+        const FaceByIndices &f = faces[face_index];
+        for (uint32_t e_idx : f.edge_indices) {
             if (edges[e_idx].is_internal())
                 return true;
         }
@@ -220,8 +237,10 @@ class Mesh {
                                         const glm::vec3 &direction = glm::vec3(0.0f)) {
         GlobalLogSection _("extrude_faces", log_mode);
 
-        if (face_indices.empty())
+        if (face_indices.empty()) {
+            global_logger->debug("no face indices");
             return {};
+        }
 
         // NOTE: A: for a collection of faces, it defines a collection of boundary edges, for any boundary edge which is
         // an internal edge relative to the original mesh, then when we extrude these faces, it creates an egde with
@@ -234,22 +253,23 @@ class Mesh {
 
         std::vector<std::pair<uint32_t, uint32_t>> boundary_edges = compute_boundary_edges(face_indices);
 
-        // Create a lookup set of EdgeKeys for fast boundary edge checking
+        // create a lookup set of edgekeys for fast boundary edge checking
         std::unordered_set<EdgeKey, EdgeKeyHash> boundary_edge_set;
         for (auto [v0, v1] : boundary_edges) {
-            boundary_edge_set.emplace(v0, v1); // EdgeKey constructor normalizes the order
+            boundary_edge_set.emplace(v0, v1); // edgekey constructor normalizes the order
         }
 
         std::vector<uint32_t> faces_to_remove;
         std::vector<uint32_t> faces_to_flip_winding_order;
 
         for (uint32_t fi : face_indices) {
-            const Face &f = faces[fi];
+            // TODO: need to put guards in place that the face idx actually exists there.
+            const FaceByIndices &f = faces[fi];
             bool has_internal_boundary_edge = false;
 
-            for (uint32_t e_idx : f.edges) {
-                const Edge &e = edges[e_idx];
-                EdgeKey key(e.v0, e.v1); // normalized edge key
+            for (uint32_t e_idx : f.edge_indices) {
+                const EdgeByIndices &e = edges[e_idx];
+                EdgeKey key(e.v0_idx, e.v1_idx); // normalized edge key
 
                 // Only consider edges that are both internal and on the boundary
                 if (e.is_internal() && boundary_edge_set.count(key)) {
@@ -273,8 +293,8 @@ class Mesh {
 
         std::unordered_set<uint32_t> vertices_to_extrude;
         for (uint32_t fi : face_indices) {
-            const Face f = faces[fi];
-            vertices_to_extrude.insert(f.vertices.begin(), f.vertices.end());
+            const FaceByIndices f = faces[fi];
+            vertices_to_extrude.insert(f.vertex_indices.begin(), f.vertex_indices.end());
         }
 
         std::unordered_map<uint32_t, uint32_t> original_to_extruded;
@@ -296,9 +316,9 @@ class Mesh {
         // create top faces
         std::vector<uint32_t> extruded_faces_indices;
         for (uint32_t fi : face_indices) {
-            const Face f = faces[fi];
+            const FaceByIndices f = faces[fi];
             std::vector<uint32_t> extruded_vertices;
-            for (uint32_t vi : f.vertices)
+            for (uint32_t vi : f.vertex_indices)
                 extruded_vertices.push_back(original_to_extruded[vi]);
 
             uint32_t top_face_index = add_face(extruded_vertices);
@@ -324,7 +344,7 @@ class Mesh {
     }
 
     void align_face(uint32_t face_index, const glm::vec3 &target_normal) {
-        Face f = faces.at(face_index);
+        FaceByIndices f = faces.at(face_index);
 
         glm::vec3 current_normal = compute_face_normal(f);
         glm::vec3 desired_normal = glm::normalize(target_normal);
@@ -355,7 +375,7 @@ class Mesh {
         glm::mat4 R = glm::rotate(glm::mat4(1.0f), angle, axis);
 
         // Rotate vertices incident to this face
-        for (uint32_t vi : f.vertices) {
+        for (uint32_t vi : f.vertex_indices) {
             glm::vec3 p = vertices[vi].position;
             glm::vec4 tmp = glm::vec4(p - centroid, 1.0f);
             p = glm::vec3(R * tmp) + centroid;
@@ -383,12 +403,13 @@ class Mesh {
                 continue; // degenerate face, skip
             }
 
-            const glm::vec3 &p0 = vertices[f.vertices[0]].position;
+            const glm::vec3 &p0 = vertices[f.vertex_indices[0]].position;
             global_logger->debug("Testing face {} with normal {}", fi, vec3_to_string(normal));
 
             // Check all other vertices
             for (size_t vi = 0; vi < vertices.size(); ++vi) {
-                if (std::find(f.vertices.begin(), f.vertices.end(), static_cast<uint32_t>(vi)) != f.vertices.end())
+                if (std::find(f.vertex_indices.begin(), f.vertex_indices.end(), static_cast<uint32_t>(vi)) !=
+                    f.vertex_indices.end())
                     continue; // skip vertices in this face
 
                 const glm::vec3 &p = vertices[vi].position;
@@ -429,10 +450,10 @@ class Mesh {
         oss << "  Edges (" << edges.size() << "):\n";
         for (size_t i = 0; i < edges.size(); ++i) {
             const auto &e = edges[i];
-            oss << "    " << i << ": (" << e.v0 << ", " << e.v1 << "), incident_faces = [";
-            for (size_t j = 0; j < e.incident_faces.size(); ++j) {
-                oss << e.incident_faces[j];
-                if (j + 1 < e.incident_faces.size())
+            oss << "    " << i << ": (" << e.v0_idx << ", " << e.v1_idx << "), incident_faces = [";
+            for (size_t j = 0; j < e.incident_face_indices.size(); ++j) {
+                oss << e.incident_face_indices[j];
+                if (j + 1 < e.incident_face_indices.size())
                     oss << ", ";
             }
             oss << "]\n";
@@ -442,15 +463,15 @@ class Mesh {
         for (size_t i = 0; i < faces.size(); ++i) {
             const auto &f = faces[i];
             oss << "    " << i << ": vertices = [";
-            for (size_t j = 0; j < f.vertices.size(); ++j) {
-                oss << f.vertices[j];
-                if (j + 1 < f.vertices.size())
+            for (size_t j = 0; j < f.vertex_indices.size(); ++j) {
+                oss << f.vertex_indices[j];
+                if (j + 1 < f.vertex_indices.size())
                     oss << ", ";
             }
             oss << "], edges = [";
-            for (size_t j = 0; j < f.edges.size(); ++j) {
-                oss << f.edges[j];
-                if (j + 1 < f.edges.size())
+            for (size_t j = 0; j < f.edge_indices.size(); ++j) {
+                oss << f.edge_indices[j];
+                if (j + 1 < f.edge_indices.size())
                     oss << ", ";
             }
             oss << "]\n";
@@ -461,82 +482,86 @@ class Mesh {
 
   private:
     // returns a pair of vertex indices
-    std::vector<std::pair<uint32_t, uint32_t>> compute_boundary_edges(const std::vector<uint32_t> &face_indices) const {
+    std::vector<std::pair<VertexIdx, VertexIdx>>
+    compute_boundary_edges(const std::vector<FaceIdx> &face_indices) const {
         std::unordered_set<uint32_t> face_set(face_indices.begin(), face_indices.end());
         std::vector<std::pair<uint32_t, uint32_t>> boundary_edges;
 
-        for (uint32_t fi : face_indices) {
-            const Face f = faces[fi];
-            size_t n = f.vertices.size();
-            for (size_t i = 0; i < n; ++i) {
-                uint32_t v0 = f.vertices[i];
-                uint32_t v1 = f.vertices[(i + 1) % n];
+        // we compute the boundary edges by iterating over every edge of every face.
+        for (FaceIdx fi : face_indices) {
+            const FaceByIndices f = faces[fi];
+            size_t num_vertices_on_face = f.vertex_indices.size();
+            for (size_t i = 0; i < num_vertices_on_face; ++i) {
+                uint32_t v0_idx = f.vertex_indices[i];
+                uint32_t v1_idx = f.vertex_indices[(i + 1) % num_vertices_on_face];
 
-                EdgeKey key(v0, v1);
+                EdgeKey key(v0_idx, v1_idx);
                 auto it = edge_lookup.find(key);
                 if (it == edge_lookup.end())
                     continue; // should not happen
 
-                const Edge e = edges[it->second];
+                const EdgeByIndices e = edges[it->second];
 
                 // count how many selected faces use this edge
                 size_t count_in_set = 0;
-                for (uint32_t face_id : e.incident_faces)
+                for (uint32_t face_id : e.incident_face_indices)
                     if (face_set.count(face_id))
                         count_in_set++;
 
                 // if edge is used by exactly one face in the set, it's a boundary edge
                 if (count_in_set == 1)
-                    boundary_edges.emplace_back(v0, v1);
+                    boundary_edges.emplace_back(v0_idx, v1_idx);
             }
         }
 
         return boundary_edges;
     }
 
-    glm::vec3 compute_face_normal(const Face &f) const {
-        if (f.vertices.size() < 3)
+    glm::vec3 compute_face_normal(const FaceByIndices &f) const {
+        if (f.vertex_indices.size() < 3)
             return glm::vec3(0.0f);
 
-        const glm::vec3 &p0 = vertices[f.vertices[0]].position;
-        const glm::vec3 &p1 = vertices[f.vertices[1]].position;
-        const glm::vec3 &p2 = vertices[f.vertices[2]].position;
+        const glm::vec3 &p0 = vertices[f.vertex_indices[0]].position;
+        const glm::vec3 &p1 = vertices[f.vertex_indices[1]].position;
+        const glm::vec3 &p2 = vertices[f.vertex_indices[2]].position;
 
         glm::vec3 normal = glm::normalize(glm::cross(p1 - p0, p2 - p0));
 
         return normal;
     }
 
-    glm::vec3 compute_face_centroid(const Face &f) const {
+    glm::vec3 compute_face_centroid(const FaceByIndices &f) const {
         glm::vec3 c(0.0f);
-        for (uint32_t v : f.vertices)
+        for (uint32_t v : f.vertex_indices)
             c += vertices[v].position;
-        return c / static_cast<float>(f.vertices.size());
+        return c / static_cast<float>(f.vertex_indices.size());
     }
+
     // finds any vector orthogonal to n
     static glm::vec3 orthogonal_vector(const glm::vec3 &n) {
         return glm::abs(n.x) < 0.9f ? glm::cross(n, glm::vec3(1, 0, 0)) : glm::cross(n, glm::vec3(0, 1, 0));
     }
 
   public:
+    // these are mappings where the id is just the index
     std::vector<Vertex> vertices;
-    std::vector<Edge> edges;
-    std::vector<Face> faces;
+    std::vector<EdgeByIndices> edges;
+    std::vector<FaceByIndices> faces;
 
   private:
     std::unordered_map<EdgeKey, uint32_t, EdgeKeyHash> edge_lookup;
 };
 
-// TODO: make it take in vertices and indices and build adapters ontop with templates
-inline Mesh to_mesh(const draw_info::IndexedVertexPositions &ivp) {
+// TODO: make it take in vertices and indices and build adapters ontop with templates and store in a different file?
+inline Mesh to_mesh(const draw_info::IndexedVertexPositions &ivp,
+                    const LogSection::LogMode &log_mode = LogSection::LogMode::inherit) {
     Mesh mesh;
+    mesh.log_mode = log_mode;
 
-    // step 1: add all vertices
     for (const auto &pos : ivp.xyz_positions) {
         mesh.add_vertex(pos);
     }
 
-    // step 2: add all faces (assume triangles)
     if (ivp.indices.size() % 3 != 0)
         throw std::runtime_error("IVP indices size must be a multiple of 3 for triangle faces");
 
@@ -555,10 +580,10 @@ inline draw_info::IndexedVertexPositions to_indexed_vertex_positions(const Mesh 
         out.xyz_positions.push_back(v.position);
 
     for (const auto &f : mesh.faces) {
-        for (size_t i = 1; i + 1 < f.vertices.size(); ++i) {
-            out.indices.push_back(f.vertices[0]);
-            out.indices.push_back(f.vertices[i]);
-            out.indices.push_back(f.vertices[i + 1]);
+        for (size_t i = 1; i + 1 < f.vertex_indices.size(); ++i) {
+            out.indices.push_back(f.vertex_indices[0]);
+            out.indices.push_back(f.vertex_indices[i]);
+            out.indices.push_back(f.vertex_indices[i + 1]);
         }
     }
 
